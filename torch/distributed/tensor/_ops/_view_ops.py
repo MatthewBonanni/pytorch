@@ -393,7 +393,11 @@ def view_groups(from_size: Shape, to_size: Shape) -> DimMap:
     - in the above, input is flattened into a single dimension and then split
       into two separate dimensions with different sizes from the input.
     """
-    from torch.fx.experimental.symbolic_shapes import guard_or_false, guard_or_true
+    from torch.fx.experimental.symbolic_shapes import (
+        free_symbols,
+        guard_or_false,
+        guard_or_true,
+    )
 
     from_nelem = prod(from_size)
     to_size = infer_size(from_nelem, normalize_sizes(to_size))
@@ -438,19 +442,50 @@ def view_groups(from_size: Shape, to_size: Shape) -> DimMap:
             from_group_dim = []
         else:
             # produces ([1], [1]),  ([2], [2]), ([2,3], [6])
-            while guard_or_true(f != t):
-                if (
-                    t % f == 0 or t > f
+            while not guard_or_false(f == t):
+                if from_idx < from_len and (
+                    to_idx >= to_len
+                    or guard_or_false(t % f == 0)
+                    or guard_or_false(t > f)
                 ):  # for easier symbolic comparisons, e.g. u0*u1 > u0
                     nf = from_size[from_idx]
                     from_group_dim.append(from_idx)
                     from_idx += 1
                     f *= nf
-                else:
+                elif to_idx < to_len and (
+                    from_idx >= from_len
+                    or guard_or_false(f % t == 0)
+                    or guard_or_false(f > t)
+                    or (free_symbols(f) and not free_symbols(t))
+                ):
                     nt = to_size[to_idx]
                     to_group_shape.append(nt)
                     to_idx += 1
                     t *= nt
+                elif from_idx < from_len and free_symbols(t) and not free_symbols(f):
+                    nf = from_size[from_idx]
+                    from_group_dim.append(from_idx)
+                    from_idx += 1
+                    f *= nf
+                elif to_idx < to_len and from_idx < from_len:
+                    # With unbacked dimensions, neither divisibility nor
+                    # ordering may be provable without a data-dependent guard.
+                    # Fall back to one conservative reshape group over the
+                    # remaining contiguous dims; sharding propagation can then
+                    # replicate if the exact split is not statically known.
+                    while from_idx < from_len:
+                        nf = from_size[from_idx]
+                        from_group_dim.append(from_idx)
+                        from_idx += 1
+                        f *= nf
+                    while to_idx < to_len:
+                        nt = to_size[to_idx]
+                        to_group_shape.append(nt)
+                        to_idx += 1
+                        t *= nt
+                    break
+                else:
+                    break
 
         if len(to_group_shape) > 0:
             flattened = Flatten.new(

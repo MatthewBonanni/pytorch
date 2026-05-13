@@ -2852,6 +2852,18 @@ class TestViewOps(DTensorContinuousTestBase):
         result = view_groups([4, u9], [4, u10])
         self.assertEqual(result, (InputDim(0), InputDim(1)))
 
+        # Splitting a product by a concrete prefix should not guard on
+        # unbacked divisibility such as ``8 % (8 * u0) == 0``.
+        u11 = fresh_sym()
+        self.assertEqual(
+            view_groups([8 * u11, 256], [8, u11, 256]),
+            (
+                Split(InputDim(0), (8, u11), 0),
+                Split(InputDim(0), (8, u11), 1),
+                InputDim(1),
+            ),
+        )
+
     def test_view_groups_unbacked_sharding_propagation(self):
         """Test that sharding is correctly propagated through view_groups with symbolic shapes."""
         from torch.fx.experimental.symbolic_shapes import ShapeEnv
