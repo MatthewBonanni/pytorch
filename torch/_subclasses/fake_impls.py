@@ -1169,6 +1169,7 @@ def slice_forward(
 ) -> FakeTensor:
     from torch.fx.experimental.symbolic_shapes import (
         guard_or_false,
+        has_free_unbacked_symbols,
         statically_known_true,
     )
 
@@ -1185,11 +1186,14 @@ def slice_forward(
 
     # start, end
     start_index = 0 if start is None else _compute_slice_index(sizes[dim], start)
-    end_index = (
-        sizes[dim]
-        if statically_known_true(end == sys.maxsize) or end is None
-        else _compute_slice_index(sizes[dim], end)
-    )
+    if end is None:
+        end_index = sizes[dim]
+    elif not has_free_unbacked_symbols(end) and statically_known_true(
+        end == sys.maxsize
+    ):
+        end_index = sizes[dim]
+    else:
+        end_index = _compute_slice_index(sizes[dim], end)
 
     # size
     new_size: IntLikeType | None = None

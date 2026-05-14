@@ -985,6 +985,31 @@ class FakeTensorTest(TestCase):
         self.assertEqual(out.shape, (4 * 2 * (seq // 2), 256))
         self.assertTrue(free_unbacked_symbols(out.shape[0]))
 
+    def test_slice_symbolic_end_skips_sys_maxsize_static_eval(self):
+        shape_env = ShapeEnv()
+        fake_mode = FakeTensorMode(allow_non_fake_inputs=True, shape_env=shape_env)
+        with fake_mode:
+            seq = shape_env.create_unbacked_symint()
+            torch._dynamo.override_optimization_hint(seq, 16)
+            base = torch.empty(seq, 8)
+            split = (seq + 7) // 8
+            start = torch.sym_min(split * 7, seq)
+            end = torch.sym_min(split * 8, seq)
+            out = base.narrow(0, start, end - start)
+
+        self.assertTrue(free_unbacked_symbols(out.shape[0]))
+
+    def test_meta_storage_trace_uses_hint_for_symbolic_size(self):
+        from torch._subclasses.meta_utils import MetaStorageDesc, MetaStorageId
+
+        shape_env = ShapeEnv()
+        size = shape_env.create_unbacked_symint()
+        torch._dynamo.override_optimization_hint(size, 16)
+
+        metadata = MetaStorageDesc(MetaStorageId(0), 3 * size, None).as_json(1)
+        self.assertEqual(metadata["size"], "3*u0")
+        self.assertEqual(metadata["size_hint"], 48)
+
     def test_matmul_rank4_unbacked_batch_dim(self):
         fake_mode, (q, k) = self.fake_with_unbacked_batch(
             torch.randn(4, 2, 8, 16),
