@@ -1112,9 +1112,10 @@ class _StridedShard(torch._C._distributed.StridedShard):
         num_chunks: int,
         rank: RankType,
         return_first_offset: bool = True,
-    ) -> tuple[int, int | list[int]]:
+        skip_offset: bool = False,
+    ) -> tuple[int, int | list[int] | None]:
         return self.local_shard_size_and_offset(
-            curr_local_size, num_chunks, rank, return_first_offset
+            curr_local_size, num_chunks, rank, return_first_offset, skip_offset
         )
 
     @maybe_run_for_local_tensor
@@ -1124,7 +1125,8 @@ class _StridedShard(torch._C._distributed.StridedShard):
         num_chunks: int,
         rank: RankType,
         return_first_offset: bool = True,
-    ) -> tuple[int, list[int] | int]:
+        skip_offset: bool = False,
+    ) -> tuple[int, list[int] | int | None]:
         """
         Compute the local shard size and offset(s) for a _StridedShard placement.
 
@@ -1139,13 +1141,17 @@ class _StridedShard(torch._C._distributed.StridedShard):
             rank (RankType): The rank index to compute the shard for.
             return_first_offset (bool): If True, return only the first offset as an int. If False,
                 return all offsets as a list. Defaults to True.
+            skip_offset (bool): If True, skip computing offsets and return None
+                for the offset. Defaults to False.
 
         Returns:
             tuple: A tuple containing:
                 - local_shard_size (int): The number of elements in the local shard for this rank.
-                - offset (int | list[int]): If return_first_offset is True, returns the first offset
-                  as an int. If False or if the shard size is 0, returns a list of all offsets
-                  (which may be empty for empty shards).
+                - offset (int | list[int] | None): If skip_offset is True,
+                  returns None. Otherwise, if return_first_offset is True,
+                  returns the first offset as an int. If False or if the shard
+                  size is 0, returns a list of all offsets (which may be empty
+                  for empty shards).
         """
         # indices_tensor is 1D torch.arange(logical_dim_size) unsqueezed
         # so that we can reuse self._split_tensor which splits on self.dim
@@ -1165,6 +1171,13 @@ class _StridedShard(torch._C._distributed.StridedShard):
         sharded_indices = [shard.view(-1) for shard in sharded_indices]
 
         local_shard_size = _StridedShard._local_shard_size(sharded_indices, rank)
+        if skip_offset:
+            # Callers that only need the shard size (e.g. the sharding propagator's
+            # local-shape adjustment for view ops) pass skip_offset=True. Under
+            # FakeTensorMode the .tolist() below allocates one unbacked SymInt per
+            # element, leaving thousands of pending fresh symbols that the
+            # PendingUnbackedSymbolNotFound check later trips on.
+            return local_shard_size, None
         if local_shard_size > 0:
             offsets = sharded_indices[rank].tolist()
         else:
