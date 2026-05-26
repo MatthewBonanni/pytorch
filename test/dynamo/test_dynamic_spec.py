@@ -691,6 +691,288 @@ class TestShapeVarDedup(TestCase):
             compiled(torch.randn(8, 3), torch.randn(8, 4))
 
 
+class TestDerivedDimSpec(TestCase):
+    def setUp(self):
+        super().setUp()
+        _reset_uid_counter()
+
+    def test_derived_dim(self):
+        """y's dim 0 = 2 * x's dim 0: correct shape runs; mismatched shape
+        raises with the failed guard expression. The derived spec also lets
+        ``y.size()[0] == 2 * x.size()[0]`` inside the compiled fn resolve
+        without DDE."""
+        B = ShapeVar("batch")
+
+        def fn(x, y):
+            if y.size()[0] == 2 * x.size()[0]:
+                return x.sum() + y.sum()
+            return x.sum() - y.sum()
+
+        compiled = torch.compile(
+            fn,
+            backend="eager",
+            fullgraph=True,
+            shapes_spec={
+                "x": TensorSpec([B, None]),
+                "y": TensorSpec([B * 2, None]),
+            },
+        )
+        # Correct: y.shape[0] = 8 = 2 * x.shape[0]
+        out = compiled(torch.randn(4, 3), torch.randn(8, 5))
+        self.assertTrue(torch.is_tensor(out))
+
+        # Violation: 7 != 2 * 4 → guard fails
+        torch._dynamo.reset()
+        with self.assertRaisesRegex(AssertionError, "Guard fail"):
+            compiled(torch.randn(4, 3), torch.randn(7, 5))
+
+        # Sanity: WITHOUT the derived spec the same conditional DDEs.
+        torch._dynamo.reset()
+        Y = ShapeVar("y_dim")
+        compiled_no_derived = torch.compile(
+            fn,
+            backend="eager",
+            fullgraph=True,
+            shapes_spec={
+                "x": TensorSpec([B, None]),
+                "y": TensorSpec([Y, None]),
+            },
+        )
+        with self.assertRaisesRegex(
+            torch._dynamo.exc.UserError,
+            r"Could not guard on data-dependent expression",
+        ):
+            compiled_no_derived(torch.randn(4, 3), torch.randn(8, 5))
+
+    def test_multi_var_derived(self):
+        """Composite expression over multiple IntVars: z.shape[0] = A * B + 1.
+        Correct shape runs; mismatched shape raises. The derived spec also
+        lets ``z.size()[0] == x.size()[0] * y.size()[0] + 1`` resolve
+        without DDE."""
+        A = ShapeVar("a")
+        B = ShapeVar("b")
+
+        def fn(x, y, z):
+            if z.size()[0] == x.size()[0] * y.size()[0] + 1:
+                return x.sum() + y.sum() + z.sum()
+            return x.sum() - y.sum() - z.sum()
+
+        compiled = torch.compile(
+            fn,
+            backend="eager",
+            fullgraph=True,
+            shapes_spec={
+                "x": TensorSpec([A, None]),
+                "y": TensorSpec([B, None]),
+                "z": TensorSpec([A * B + 1, None]),
+            },
+        )
+        # Correct: z.shape[0] = 3 * 4 + 1 = 13
+        out = compiled(torch.randn(3, 2), torch.randn(4, 2), torch.randn(13, 2))
+        self.assertTrue(torch.is_tensor(out))
+
+        # Violation: 99 != 3 * 4 + 1
+        torch._dynamo.reset()
+        with self.assertRaisesRegex(AssertionError, "Guard fail"):
+            compiled(torch.randn(3, 2), torch.randn(4, 2), torch.randn(99, 2))
+
+        # Sanity: WITHOUT the derived spec the same conditional DDEs.
+        torch._dynamo.reset()
+        Z = ShapeVar("z_dim")
+        compiled_no_derived = torch.compile(
+            fn,
+            backend="eager",
+            fullgraph=True,
+            shapes_spec={
+                "x": TensorSpec([A, None]),
+                "y": TensorSpec([B, None]),
+                "z": TensorSpec([Z, None]),
+            },
+        )
+        with self.assertRaisesRegex(
+            torch._dynamo.exc.UserError,
+            r"Could not guard on data-dependent expression",
+        ):
+            compiled_no_derived(
+                torch.randn(3, 2), torch.randn(4, 2), torch.randn(13, 2)
+            )
+
+    def test_orphan_intvar_raises(self):
+        """B is used in derived expression but never as a bare slot → finalize raises."""
+        A = ShapeVar("a")
+        B = ShapeVar("b")
+
+        def fn(x):
+            return x.sum()
+
+        # A * B in slot but neither A nor B has a bare-IntVar binding via inputs
+        compiled = torch.compile(
+            fn,
+            backend="eager",
+            fullgraph=True,
+            shapes_spec={"x": TensorSpec([A * B, None])},
+        )
+        with self.assertRaises(torch._dynamo.exc.InternalTorchDynamoError) as cm:
+            compiled(torch.randn(4, 3))
+        self.assertIn(
+            "ValueError: shapes_spec: 1 pending check(s) reference unbound "
+            "IntVar(s) ['a', 'b']. Every IntVar used in a derived "
+            "expression or assumption must also appear as a bare-IntVar slot "
+            "somewhere in the spec.",
+            str(cm.exception),
+        )
+
+    def test_derived_scalar_arg(self):
+        """Scalar arg slot can be a derived expression: n must equal 2 * x.shape[0].
+        Correct value runs; mismatched value raises. The derived spec also
+        lets ``n == 2 * x.size()[0]`` resolve without DDE."""
+        B = ShapeVar("batch")
+
+        def fn(x, n):
+            if n == 2 * x.size()[0]:
+                return x.sum() + n
+            return x.sum() - n
+
+        compiled = torch.compile(
+            fn,
+            backend="eager",
+            fullgraph=True,
+            shapes_spec={"x": TensorSpec([B, None]), "n": B * 2},
+        )
+        # Correct: n = 8 = 2 * x.size()[0]
+        out = compiled(torch.randn(4, 3), 8)
+        self.assertTrue(torch.is_tensor(out))
+
+        # Violation: n = 7 != 2 * 4
+        torch._dynamo.reset()
+        with self.assertRaisesRegex(AssertionError, "Guard fail"):
+            compiled(torch.randn(4, 3), 7)
+
+        # Sanity: WITHOUT the derived spec the same conditional DDEs.
+        torch._dynamo.reset()
+        N = IntVar("n_var")
+        compiled_no_derived = torch.compile(
+            fn,
+            backend="eager",
+            fullgraph=True,
+            shapes_spec={"x": TensorSpec([B, None]), "n": N},
+        )
+        with self.assertRaisesRegex(
+            torch._dynamo.exc.UserError,
+            r"Could not guard on data-dependent expression",
+        ):
+            compiled_no_derived(torch.randn(4, 3), 8)
+
+    def test_foreign_symint_rejected_at_construction(self):
+        """A SymInt backed by a different ShapeEnv must be rejected at
+        TensorSpec construction."""
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        real_env = ShapeEnv()
+        foreign_symint = real_env.create_unbacked_symint()
+        with self.assertRaisesRegex(
+            TypeError,
+            r"TensorSpec dim 0: SymInt spec values must originate from spec "
+            r"IntVar / ShapeVar; got u0 backed by a different ShapeEnv\.",
+        ):
+            TensorSpec([foreign_symint, None])
+
+    def test_misuse_in_python_conditional_raises(self):
+        """Using a spec IntVar in a Python bool context raises (don't allow
+        accidental guards on spec-time values)."""
+        A = ShapeVar("a")
+        with self.assertRaises(Exception):
+            if A > 1:
+                pass
+
+    def test_misuse_torch_check_outside_assumptions_raises(self):
+        """torch._check on a spec IntVar outside the assumptions context raises."""
+        A = ShapeVar("a")
+        with self.assertRaises(Exception):
+            torch._check(A > 1)
+
+    def test_order_independence(self):
+        """Composite slot (z = A * B) wired BEFORE bare-IntVar slots: the
+        derived check is deferred, then emitted once both A and B are bound.
+        Correct shape runs; mismatched shape raises with the failed guard."""
+        A = ShapeVar("a")
+        B = ShapeVar("b")
+
+        def fn(z, x, y):
+            # z processed first (dim references unbound A and B);
+            # x binds A, y binds B; pending check then fires.
+            if z.size()[0] == x.size()[0] * y.size()[0]:
+                return z.sum() + x.sum() + y.sum()
+            return z.sum() - x.sum() - y.sum()
+
+        compiled = torch.compile(
+            fn,
+            backend="eager",
+            fullgraph=True,
+            shapes_spec={
+                "z": TensorSpec([A * B, None]),
+                "x": TensorSpec([A, None]),
+                "y": TensorSpec([B, None]),
+            },
+        )
+        # Correct: z.shape[0] = 3 * 4 = 12
+        out = compiled(torch.randn(12, 2), torch.randn(3, 2), torch.randn(4, 2))
+        self.assertTrue(torch.is_tensor(out))
+
+        # Violation: 99 != 3 * 4
+        torch._dynamo.reset()
+        with self.assertRaisesRegex(AssertionError, "Guard fail"):
+            compiled(torch.randn(99, 2), torch.randn(3, 2), torch.randn(4, 2))
+
+        # Sanity: WITHOUT the derived spec the same conditional DDEs.
+        torch._dynamo.reset()
+        Z = ShapeVar("z_dim")
+        compiled_no_derived = torch.compile(
+            fn,
+            backend="eager",
+            fullgraph=True,
+            shapes_spec={
+                "z": TensorSpec([Z, None]),
+                "x": TensorSpec([A, None]),
+                "y": TensorSpec([B, None]),
+            },
+        )
+        with self.assertRaisesRegex(
+            torch._dynamo.exc.UserError,
+            r"Could not guard on data-dependent expression",
+        ):
+            compiled_no_derived(
+                torch.randn(12, 2), torch.randn(3, 2), torch.randn(4, 2)
+            )
+
+    def test_same_derived_expr_in_two_slots(self):
+        """Two tensor dims both spec'd as the same derived expression (B * 2)
+        must both equal each other at runtime.
+
+        Note: the equality is enforced at runtime (each slot deferred-asserts
+        ``u_i == 2 * u_x``) but ShapeEnv doesn't transitively conclude
+        ``u_y == u_z`` at compile time, so ``if y.size()[0] == z.size()[0]``
+        would DDE."""
+        B = ShapeVar("batch")
+
+        def fn(x, y, z):
+            return x.sum() + y.sum() + z.sum()
+
+        compiled = torch.compile(
+            fn,
+            backend="eager",
+            fullgraph=True,
+            shapes_spec={
+                "x": TensorSpec([B, None]),
+                "y": TensorSpec([B * 2, None]),
+                "z": TensorSpec([B * 2, None]),
+            },
+        )
+        # y.shape[0] and z.shape[0] both = 8 (= 2 * x.shape[0])
+        out = compiled(torch.randn(4, 3), torch.randn(8, 5), torch.randn(8, 5))
+        self.assertTrue(torch.is_tensor(out))
+
+
 class TestObjectSpec(TestCase):
     """``ObjectSpec`` data class — construction, access, repr."""
 
