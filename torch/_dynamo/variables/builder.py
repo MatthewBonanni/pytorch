@@ -4373,6 +4373,22 @@ def _drain_shape_spec_pending_assumptions(shape_env: ShapeEnv) -> None:
     shape_env._shape_spec_pending_assumptions[:] = keep
 
 
+def _wire_spec_assumptions(shape_env: ShapeEnv, shapes_spec: ShapesSpec) -> None:
+    """Append each ShapesSpec.assumptions SymBool to the pending list.
+    Called BEFORE any input is processed (``_spec_symbol_to_compile_symbol``
+    is empty), so every assumption defers. Drain happens on bare-IntVar
+    bindings; finalize raises if any still has unbound deps at end of trace.
+    """
+    assumptions = getattr(shapes_spec, "_assumptions", None)
+    if not assumptions:
+        return
+    for a in assumptions:
+        bool_expr = a.node.expr
+        shape_env._shape_spec_pending_assumptions.append(
+            (bool_expr.free_symbols, bool_expr)
+        )
+
+
 def _finalize_spec_wiring(shape_env: ShapeEnv) -> None:
     """Verify all pending spec assumptions/derived-dim checks have been
     emitted (i.e. every spec IntVar referenced by a derived expression or
@@ -4384,17 +4400,34 @@ def _finalize_spec_wiring(shape_env: ShapeEnv) -> None:
     from torch.fx.experimental.dynamic_spec import _intvar_symbol_registry
 
     subst_keys = shape_env._spec_symbol_to_compile_symbol.keys()
-    unbound: set[Any] = set()
-    for free, _ in pending:
-        unbound |= free - subst_keys
-    names = sorted(
-        _intvar_symbol_registry[s].name for s in unbound if s in _intvar_symbol_registry
-    )
+
+    def _name(s: Any) -> str:
+        iv = _intvar_symbol_registry.get(s)
+        return iv.name if iv is not None else str(s)
+
+    # Build a "expr (unbound: [...])" line per pending check that still
+    # has unbound deps, with user-given IntVar names.
+    lines = []
+    all_unbound: set[Any] = set()
+    for free, bool_expr in pending:
+        missing = free - subst_keys
+        if not missing:
+            raise RuntimeError(
+                f"_finalize_spec_wiring: pending entry has all symbols bound "
+                f"({bool_expr}); _drain_shape_spec_pending_assumptions should "
+                f"have removed it before finalize."
+            )
+        all_unbound |= missing
+        rename = {s: sympy.Symbol(_name(s)) for s in free}
+        pretty_expr = bool_expr.xreplace(rename)
+        missing_names = sorted(_name(s) for s in missing)
+        lines.append(f"  - {pretty_expr}  (unbound: {missing_names})")
     raise ValueError(
-        f"shapes_spec: {len(pending)} pending check(s) reference unbound "
-        f"IntVar(s) {names}. Every IntVar used in a derived expression or "
-        f"assumption must also appear as a bare-IntVar slot somewhere in "
-        f"the spec."
+        f"shapes_spec: {len(lines)} pending check(s) reference unbound "
+        f"IntVar(s) {sorted(_name(s) for s in all_unbound)}. Every IntVar "
+        f"used in a derived expression or assumption must also appear as a "
+        f"bare-IntVar slot somewhere in the spec. Offending checks:\n"
+        + "\n".join(lines)
     )
 
 
